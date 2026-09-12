@@ -1,6 +1,6 @@
 ---
 name: token-watchdog
-version: 0.1.0
+version: 0.2.0
 description: >-
   Track and audit an iLander's Token usage when the Parent or agent asks about
   Token spend, burn rate, LLM charges, task cost, expensive runs, runaway
@@ -92,6 +92,7 @@ Observed raw entry types include:
 
 - billing_v2_llm_charge
 - billing_v2_ilands_tool_charge
+- billing_v2_dl_charge
 - billing_v2_dl_refund
 - growth_level_reward
 - token_transfer
@@ -197,6 +198,24 @@ Current model:
 Never invent page numbers. If token-statement returns a cursor, follow that exact
 cursor until there is no continuation or the requested window is exhausted.
 
+## Timestamp normalization
+
+Current runtime behavior observed during acceptance testing:
+
+- `--since` / `--until` accepts UTC `Z`
+- full offsets such as `+00:00` are valid
+- truncated offsets such as `+00` can return HTTP 400
+
+Before issuing a time-bounded statement query, normalize timestamps to one of:
+
+    2026-09-12T12:34:56Z
+
+or:
+
+    2026-09-12T12:34:56+00:00
+
+Do not send truncated timezone offsets.
+
 ## Normalization
 
 For each ledger entry, preserve the original raw values.
@@ -224,6 +243,11 @@ If a field is absent, store UNKNOWN rather than inferring it.
 For `tool_args_fingerprint`, compare normalized argument structures only when
 tool_args are actually exposed. Do not reconstruct hidden arguments.
 
+Acceptance testing found that `tool_args` may be absent from practical ledger
+entries even when other attribution fields are present. Therefore
+REPEATED_TOOL_ARGS is a low-availability corroborating signal, not a required
+signal for healthy operation or anomaly detection.
+
 ## Spend classification
 
 Use ledger evidence, not names guessed from prose.
@@ -239,7 +263,13 @@ Entries whose raw type identifies an iLands tool charge, such as:
 `billing_v2_ilands_tool_charge`.
 
 ### Generation/vendor
-Use metadata/provider/tool attribution when the ledger makes it distinguishable.
+Treat explicit `billing_v2_dl_charge` entries as generation/vendor debit unless
+current runtime documentation says otherwise.
+
+Treat `billing_v2_dl_refund` as the corresponding refund class.
+
+Use metadata/provider/tool attribution for finer breakdowns when the ledger makes
+them distinguishable. Preserve the raw entry type in every report.
 
 ### Refund
 Entries explicitly classified or typed as refunds, including known dl refunds.
@@ -256,6 +286,31 @@ Keep platform/growth rewards separate from customer/business earnings.
 
 ### Unknown
 Anything not proven by the ledger.
+
+## No-run / unattributed spend
+
+Entries without `runId` MUST remain in the accounting totals.
+
+Never discard them merely because run-level attribution is unavailable.
+
+For every analysis window, calculate:
+
+- no-run debit total
+- no-run credit total
+- no-run entry count
+- top no-run raw entry types
+- top no-run tools/providers when exposed
+- largest individual no-run debit
+
+This bucket is especially important for iLands tool charges and `dl` charges that
+may legitimately carry no runId.
+
+Call this bucket:
+
+    UNATTRIBUTED_TO_RUN
+
+This means "not attributable to a runId", NOT "unknown cause". A raw entry type,
+tool, or provider may still identify the cost source.
 
 ## Historical baseline
 
@@ -365,6 +420,25 @@ If only cost is high:
 
 Never output `CONFIRMED_LOOP` from billing data alone.
 
+### 8. SINGLE_LLM_ENTRY_PER_RUN counterevidence
+
+If the suspicious window shows:
+- maximum LLM-entry count per run == 1
+- no repeated-tool evidence
+- no debit/refund retry pattern
+
+then treat this as strong counterevidence to a classic LLM retry loop.
+
+A high-cost run under this signature should normally be classified:
+
+    SINGLE_CALL_SPIKE
+
+or:
+
+    EXPENSIVE_RUN, CAUSE_UNRESOLVED
+
+not POSSIBLE_LOOP.
+
 ## Severity
 
 Use:
@@ -430,6 +504,9 @@ Window:
 - baseline quality: GOOD / LIMITED / INSUFFICIENT
 
 Ledger:
+- entries retrieved:
+- pages/cursors consumed:
+- coverage: COMPLETE / PARTIAL
 - total settled debits:
 - total settled credits:
 - net change:
@@ -440,6 +517,14 @@ Ledger:
 - transfers/gifts:
 - platform/growth rewards:
 - unknown/unclassified:
+
+Unattributed-to-run:
+- debit total:
+- credit total:
+- entry count:
+- top raw entry types:
+- top tools/providers:
+- largest debit:
 
 Run analysis:
 - unique runIds:
@@ -468,6 +553,21 @@ Measurement note:
 "Token-statement reflects settled ledger entries. This is not a live mid-call
 meter, and current totals may lag work still executing."
 
+## Reconciliation check
+
+Before finalizing a report:
+
+1. Sum all visible debit entries.
+2. Sum all visible credit entries.
+3. Sum every reporting bucket independently.
+4. Confirm bucketed debits reconcile to visible debit total.
+5. Confirm bucketed credits reconcile to visible credit total.
+6. If they do not reconcile, report the exact residual under
+   `UNCLASSIFIED_RESIDUAL` and do not hide it.
+
+This prevents a clean-looking report from silently dropping unknown/no-run entry
+types.
+
 ## Compact mode
 
 If the Parent asks for a quick check, return only:
@@ -493,8 +593,10 @@ When asked "is something looping?":
 6. Inspect timestamps for clustering.
 7. Inspect refunds.
 8. Compare against historical run median.
-9. Look for output/content attribution only as supporting evidence.
-10. Return:
+9. Separately total no-run charges by raw entry type; do not force them into a
+   suspicious run.
+10. Look for output/content attribution only as supporting evidence.
+11. Return:
     - LOOP-LIKE
     - NOT LOOP-LIKE
     - UNRESOLVED
@@ -562,12 +664,27 @@ State:
 Do not fabricate a baseline.
 Use structural indicators only.
 
+## v0.2 acceptance-derived changes
+
+v0.2 incorporates live acceptance findings:
+
+- normalize query timestamps to `Z` or full `+HH:MM` offsets
+- recognize `billing_v2_dl_charge` explicitly
+- keep `billing_v2_dl_refund` paired with dl debit accounting
+- add a dedicated `UNATTRIBUTED_TO_RUN` section
+- treat single-LLM-entry-per-run as loop counterevidence
+- document that tool_args may often be absent
+- report pages/entries/coverage
+- require debit/credit reconciliation before final output
+
 ## End condition
 
 The run is complete when:
 1. the requested time window is fully read or explicitly marked partial,
 2. ledger categories reconcile to the visible entries,
 3. run-level groups are calculated where possible,
-4. anomalies are labeled with evidence and counterevidence,
-5. measurement limitations are stated,
-6. no write/commit action has been taken.
+4. no-run entries remain included and are separately summarized,
+5. debit/credit bucket totals reconcile or expose a residual,
+6. anomalies are labeled with evidence and counterevidence,
+7. measurement limitations are stated,
+8. no write/commit action has been taken.
