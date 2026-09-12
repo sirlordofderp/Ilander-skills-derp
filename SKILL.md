@@ -1,14 +1,15 @@
 ---
 name: token-watchdog
-version: 0.2.0
+version: 0.3.0
 description: >-
   Track and audit an iLander's Token usage when the Parent or agent asks about
   Token spend, burn rate, LLM charges, task cost, expensive runs, runaway
-  sessions, retry loops, failure loops, cost anomalies, or a Token flight
-  recorder. Uses read-only token-statement and model state, groups settled
-  charges by run/tool/provider/type, compares them with historical baselines,
-  and reports suspected loop-like behavior without spending, transferring,
-  canceling, switching models, or changing schedules.
+  sessions, retry loops, failure loops, cost anomalies, burst minutes, or a
+  Token flight recorder. Uses read-only token-statement and model state, groups
+  settled charges by run/tool/provider/type/time, compares them with historical
+  baselines, and reports suspected anomalies without spending, transferring,
+  canceling, switching models, or changing schedules. Final output is plain
+  text by default; do not require JSON deliverables.
 allowed-tools: Bash(ilands:*)
 metadata:
   ilands:
@@ -29,6 +30,42 @@ work from patterns that look like repeated failed/retried LLM activity.
 This skill NEVER claims to provide live mid-call metering. `token-statement`
 records settled ledger entries after they appear. Treat all current-task totals
 as "settled so far", not as a hard real-time meter.
+
+
+## Output format rule
+
+`token-statement` may return structured JSON internally. That is an INPUT format,
+not a required user-facing OUTPUT format.
+
+Default final output MUST be ordinary plain text.
+
+When a file is requested, prefer:
+- `.txt` for full reports or raw-ledger exports
+- `.csv` for flattened tables when a spreadsheet-like view is useful
+
+Do NOT require the Parent or agent to consume a `.json` file.
+
+If a raw ledger export is requested and JSON attachments are inconvenient or
+unsupported, write a `.txt` ledger using one human-readable record block per
+entry:
+
+    ENTRY 0001
+    timestamp: ...
+    amount: ...
+    direction: ...
+    raw_entry_type: ...
+    run_id: ...
+    tool_name: ...
+    provider: ...
+    balance_after: ...
+    metadata:
+      key: value
+      key: value
+
+Nested values should be rendered as indented `key: value` text, not JSON syntax.
+
+A compact tabular export may use CSV with flattened fields. Preserve unknown
+fields in the TXT export rather than dropping them.
 
 ## Non-goals
 
@@ -172,6 +209,46 @@ Use a bounded historical window and report:
 - anomaly candidates
 
 Do not call gifts/subsidies "business revenue".
+
+
+### E. Minute-burst audit
+
+Use when asked:
+- "did I burn Tokens while idle?"
+- "find the 30-tokens-a-minute thing"
+- "show burst minutes"
+- "alert-worthy minutes"
+- "which minute was worst?"
+
+Bin ALL settled debit entries by UTC minute regardless of whether they have a
+runId.
+
+For each minute calculate:
+- total debit
+- LLM debit
+- non-LLM debit
+- debit entry count
+- distinct runIds
+- raw entry types
+- top tool/provider when exposed
+
+Default advisory thresholds:
+
+    >= 100 Tokens/minute  -> BURST_WARNING
+    >= 250 Tokens/minute  -> HIGH_BURN_BURST
+    >= 400 Tokens/minute  -> EXTREME_BURN_BURST
+
+Also flag:
+
+    SUSTAINED_BURST
+
+when 3 consecutive minutes each exceed 100 Tokens.
+
+These are heuristic alert thresholds, not platform limits.
+
+If the requested window is described as "idle" or "quiet hours", compare the
+burst against the user's stated intended activity. Do not infer that an agent
+was idle merely from missing runId or missing artifact output.
 
 ## Current command shape
 
@@ -439,6 +516,27 @@ or:
 
 not POSSIBLE_LOOP.
 
+## Time-density analysis
+
+Run-level grouping alone can miss wallet-wide bursts.
+
+For any broad burn investigation:
+1. group all debit entries into UTC one-minute bins;
+2. calculate total, LLM, and non-LLM debit per minute;
+3. identify the top 10 most expensive minutes;
+4. identify consecutive high-burn streaks;
+5. keep entries with no runId in the minute totals;
+6. report whether the burst is dominated by:
+   - one LLM charge,
+   - multiple LLM charges,
+   - dl/vendor spend,
+   - iLands tool charges,
+   - mixed/unknown spend.
+
+A high-burn minute is not automatically a loop.
+
+Strong loop evidence still requires repeated/clustered behavior beyond raw cost.
+
 ## Severity
 
 Use:
@@ -534,6 +632,17 @@ Run analysis:
 - repeated tool-arg patterns:
 - debit/refund churn:
 
+Minute-density:
+- highest-burn minute:
+- highest-burn minute total:
+- LLM share of highest minute:
+- non-LLM share of highest minute:
+- minutes >= 100:
+- minutes >= 250:
+- minutes >= 400:
+- sustained 3-minute bursts:
+- top 5 burst minutes:
+
 Anomaly:
 - status: NORMAL / ELEVATED / POSSIBLE_LOOP / SEVERE_ANOMALY / CAUSE_UNRESOLVED
 - evidence:
@@ -568,6 +677,47 @@ Before finalizing a report:
 This prevents a clean-looking report from silently dropping unknown/no-run entry
 types.
 
+## Plain-text delivery modes
+
+### Human report — DEFAULT
+
+Return the normal report directly as plain text.
+
+### TXT full ledger export
+
+When the user asks to "spit out the data", "dump the ledger", "give me all the
+entries", or equivalent, create a `.txt` file containing every retrieved ledger
+entry as human-readable field blocks.
+
+Requirements:
+- preserve entry order;
+- include the exact requested time window;
+- state number of pages/cursors consumed;
+- state total entries;
+- state COMPLETE or PARTIAL coverage;
+- include every API-returned field that is safe to expose to the Parent;
+- retain unknown entry types verbatim;
+- do not silently summarize or deduplicate raw entries.
+
+### CSV flattened export
+
+Use only when explicitly useful.
+
+Suggested columns:
+
+    timestamp,amount,direction,classification,raw_entry_type,run_id,job_ref,
+    tool_name,provider,pricing_key,balance_after,counterparty_type,
+    output_artifact_id,content_id
+
+Do not force nested metadata into malformed pseudo-JSON. Put fields that cannot
+be faithfully flattened in the TXT export instead.
+
+### JSON
+
+JSON may be consumed internally from CLI responses, but is NEVER required as a
+final deliverable. Only emit a `.json` file if the Parent explicitly asks for
+JSON and the destination accepts it.
+
 ## Compact mode
 
 If the Parent asks for a quick check, return only:
@@ -585,18 +735,19 @@ When asked "is something looping?":
 
 1. Pull the suspicious time window.
 2. Page all entries.
-3. Identify the highest-cost runIds.
-4. Separate:
+3. Bin all debits by minute and identify high-burn bursts.
+4. Identify the highest-cost runIds.
+5. Separate:
    - one giant charge
    - many LLM charges
-5. Inspect repeated toolName/tool_args fingerprints.
-6. Inspect timestamps for clustering.
-7. Inspect refunds.
-8. Compare against historical run median.
-9. Separately total no-run charges by raw entry type; do not force them into a
+6. Inspect repeated toolName/tool_args fingerprints.
+7. Inspect timestamps for clustering.
+8. Inspect refunds.
+9. Compare against historical run median.
+10. Separately total no-run charges by raw entry type; do not force them into a
    suspicious run.
-10. Look for output/content attribution only as supporting evidence.
-11. Return:
+11. Look for output/content attribution only as supporting evidence.
+12. Return:
     - LOOP-LIKE
     - NOT LOOP-LIKE
     - UNRESOLVED
@@ -664,6 +815,22 @@ State:
 Do not fabricate a baseline.
 Use structural indicators only.
 
+## v0.3 acceptance-derived changes
+
+v0.3 adds:
+- plain-text output as the default final format
+- `.txt` raw-ledger export with human-readable record blocks
+- optional flattened `.csv` export
+- JSON treated as internal input unless explicitly requested for final delivery
+- wallet-wide one-minute burn-density analysis
+- 100 / 250 / 400 Tokens-per-minute advisory burst thresholds
+- sustained-burst detection for 3 consecutive minutes above 100
+- top burst-minute reporting independent of runId
+
+These changes are based on lifetime-ledger testing in which a 410-entry history
+required 9 cursor-paged calls and one quiet-hours interval showed a concentrated
+2,656-Token burn event that run-level analysis alone did not fully characterize.
+
 ## v0.2 acceptance-derived changes
 
 v0.2 incorporates live acceptance findings:
@@ -685,6 +852,10 @@ The run is complete when:
 3. run-level groups are calculated where possible,
 4. no-run entries remain included and are separately summarized,
 5. debit/credit bucket totals reconcile or expose a residual,
-6. anomalies are labeled with evidence and counterevidence,
-7. measurement limitations are stated,
-8. no write/commit action has been taken.
+6. minute-density analysis is included when the request concerns bursts,
+   idle burn, or broad spending anomalies,
+7. final user-facing output is plain text unless another format was explicitly
+   requested,
+8. anomalies are labeled with evidence and counterevidence,
+9. measurement limitations are stated,
+10. no write/commit action has been taken.
